@@ -5,12 +5,16 @@
 package tscaddy
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -21,9 +25,32 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"tailscale.com/tsnet"
 )
 
 func init() {
+	caddycmd.RegisterCommand(caddycmd.Command{
+		Name:  "tailscale-auth",
+		Func:  cmdTailscaleAuth,
+		Usage: "[--hostname <name>] [--control-url <url>] [--state-dir <dir>] [--auth-key <key>]",
+		Short: "Authenticate a Tailscale node before starting Caddy",
+		Long: `
+Checks the authentication status of a Tailscale node and, if needed, displays
+the auth URL for the user to visit in a browser. Blocks until the node is
+authenticated, then prints the node's Tailscale IPs and exits.
+
+Since state is persisted to the same directory Caddy will use, the subsequent
+"caddy run" picks up the auth state automatically.`,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("tailscale-auth", flag.ExitOnError)
+			fs.String("hostname", "caddy", "Tailscale node hostname")
+			fs.String("control-url", "", "Custom Tailscale control server URL")
+			fs.String("state-dir", "", "Override the state directory")
+			fs.String("auth-key", "", "Tailscale auth key for non-interactive authentication")
+			return fs
+		}(),
+	})
+
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "tailscale-proxy",
 		Func:  cmdTailscaleProxy,
@@ -238,4 +265,54 @@ func cmdTailscaleProxy(fs caddycmd.Flags) (int, error) {
 	fmt.Printf("Caddy proxying %s -> %s\n", fromAddr.String(), toAddr)
 
 	select {}
+}
+
+func cmdTailscaleAuth(fs caddycmd.Flags) (int, error) {
+	hostname := fs.String("hostname")
+	controlURL := fs.String("control-url")
+	stateDir := fs.String("state-dir")
+	authKey := fs.String("auth-key")
+
+	if stateDir == "" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("unable to determine config directory: %v", err)
+		}
+		stateDir = filepath.Join(configDir, "tsnet-caddy-"+hostname)
+	}
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return caddy.ExitCodeFailedStartup, fmt.Errorf("unable to create state directory: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Tailscale auth: checking node %q...\n", hostname)
+
+	s := &tsnet.Server{
+		Hostname:   hostname,
+		Dir:        stateDir,
+		AuthKey:    authKey,
+		ControlURL: controlURL,
+		Logf:       func(string, ...any) {}, // suppress debug noise
+		UserLogf: func(format string, args ...any) {
+			msg := fmt.Sprintf(format, args...)
+			if strings.Contains(msg, "/a/") {
+				fmt.Fprintf(os.Stderr, "\n  To authenticate, visit:\n\n    %s\n\n  Waiting for authentication...\n", strings.TrimSpace(msg))
+			} else {
+				fmt.Fprintf(os.Stderr, "%s\n", strings.TrimSpace(msg))
+			}
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	status, err := s.Up(ctx)
+	if err != nil {
+		s.Close()
+		return caddy.ExitCodeFailedStartup, fmt.Errorf("tailscale auth failed: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "Authenticated! Node %q has IPs: %v\n", hostname, status.TailscaleIPs)
+
+	s.Close()
+	return caddy.ExitCodeSuccess, nil
 }
