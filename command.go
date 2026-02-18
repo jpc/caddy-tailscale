@@ -54,7 +54,7 @@ Since state is persisted to the same directory Caddy will use, the subsequent
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "tailscale-proxy",
 		Func:  cmdTailscaleProxy,
-		Usage: "[--from <addr>] [--to <addr>] [--change-host-header]",
+		Usage: "[--from <addr>] [--to <addr>] [--change-host-header] [--watch-stdin]",
 		Short: "A quick reverse proxy with Tailscale authentication",
 		Long: `
 A copy of caddy's standard production-ready reverse proxy with Tailscale
@@ -86,6 +86,7 @@ default, all incoming headers are passed through unmodified.)
 			fs.Bool("insecure", false, "Disable TLS verification (WARNING: DISABLES SECURITY BY NOT VERIFYING SSL CERTIFICATES!)")
 			fs.Bool("internal-certs", false, "Use internal CA for issuing certs")
 			fs.Bool("debug", false, "Enable debug logging")
+			fs.Bool("watch-stdin", false, "Watch stdin and exit when it closes (for use as a subprocess)")
 			return fs
 		}(),
 	})
@@ -100,6 +101,7 @@ func cmdTailscaleProxy(fs caddycmd.Flags) (int, error) {
 	insecure := fs.Bool("insecure")
 	internalCerts := fs.Bool("internal-certs")
 	debug := fs.Bool("debug")
+	watchStdinFlag := fs.Bool("watch-stdin")
 
 	httpPort := strconv.Itoa(caddyhttp.DefaultHTTPPort)
 	httpsPort := strconv.Itoa(caddyhttp.DefaultHTTPSPort)
@@ -263,6 +265,10 @@ func cmdTailscaleProxy(fs caddycmd.Flags) (int, error) {
 	}
 
 	fmt.Printf("Caddy proxying %s -> %s\n", fromAddr.String(), toAddr)
+
+	if watchStdinFlag {
+		go watchStdin()
+	}
 
 	select {}
 }

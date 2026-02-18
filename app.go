@@ -44,6 +44,11 @@ type App struct {
 	// Tags to apply to all nodes when registered.
 	Tags []string `json:"tags,omitempty" caddy:"namespace=tailscale.tags"`
 
+	// WatchStdin, when true, watches stdin and triggers a graceful shutdown
+	// when it closes. This is useful when Caddy is spawned as a subprocess
+	// and should exit when the parent process dies.
+	WatchStdin bool `json:"watch_stdin,omitempty" caddy:"namespace=tailscale.watch_stdin"`
+
 	// Nodes is a map of per-node configuration which overrides global options.
 	Nodes map[string]Node `json:"nodes,omitempty" caddy:"namespace=tailscale"`
 
@@ -93,6 +98,9 @@ func (t *App) Provision(ctx caddy.Context) error {
 }
 
 func (t *App) Start() error {
+	if t.WatchStdin {
+		go watchStdin()
+	}
 	return nil
 }
 
@@ -150,6 +158,16 @@ func parseAppConfig(d *caddyfile.Dispenser, _ any) (any, error) {
 			}
 		case "tags":
 			app.Tags = d.RemainingArgs()
+		case "watch_stdin":
+			if d.NextArg() {
+				v, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					return nil, d.WrapErr(err)
+				}
+				app.WatchStdin = v
+			} else {
+				app.WatchStdin = true
+			}
 		default:
 			node, err := parseNodeConfig(d)
 			if app.Nodes == nil {

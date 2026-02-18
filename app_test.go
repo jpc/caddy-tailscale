@@ -82,6 +82,30 @@ func Test_ParseApp(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "watch_stdin",
+			d: caddyfile.NewTestDispenser(`
+				tailscsale {
+					watch_stdin
+				}`),
+			want: `{"watch_stdin":true}`,
+		},
+		{
+			name: "watch_stdin: true",
+			d: caddyfile.NewTestDispenser(`
+				tailscsale {
+					watch_stdin true
+				}`),
+			want: `{"watch_stdin":true}`,
+		},
+		{
+			name: "watch_stdin: false",
+			d: caddyfile.NewTestDispenser(`
+				tailscsale {
+					watch_stdin false
+				}`),
+			want: `{}`,
+		},
+		{
 			name: "empty server",
 			d: caddyfile.NewTestDispenser(`
 				tailscsale {
