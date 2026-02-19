@@ -52,6 +52,26 @@ Since state is persisted to the same directory Caddy will use, the subsequent
 	})
 
 	caddycmd.RegisterCommand(caddycmd.Command{
+		Name:  "tailscale-run",
+		Func:  cmdTailscaleRun,
+		Usage: "[--debug]",
+		Short: "Run Caddy with JSON config from stdin, then watch stdin for parent death",
+		Long: `
+Reads exactly one JSON config object from stdin using a streaming decoder
+(without requiring EOF), starts Caddy with that config, then watches stdin
+for EOF to trigger a graceful shutdown.
+
+This is designed for use as a subprocess: the parent writes a JSON config
+object to the child's stdin and keeps stdin open as a liveness signal. When
+the parent exits (or closes its end of the pipe), the child shuts down.`,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("tailscale-run", flag.ExitOnError)
+			fs.Bool("debug", false, "Enable debug logging")
+			return fs
+		}(),
+	})
+
+	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "tailscale-proxy",
 		Func:  cmdTailscaleProxy,
 		Usage: "[--from <addr>] [--to <addr>] [--change-host-header] [--watch-stdin]",
@@ -90,6 +110,39 @@ default, all incoming headers are passed through unmodified.)
 			return fs
 		}(),
 	})
+}
+
+func cmdTailscaleRun(fs caddycmd.Flags) (int, error) {
+	caddy.TrapSignals()
+
+	debug := fs.Bool("debug")
+
+	var cfg caddy.Config
+	if err := json.NewDecoder(os.Stdin).Decode(&cfg); err != nil {
+		return caddy.ExitCodeFailedStartup, fmt.Errorf("reading config from stdin: %v", err)
+	}
+
+	if debug {
+		if cfg.Logging == nil {
+			cfg.Logging = &caddy.Logging{}
+		}
+		if cfg.Logging.Logs == nil {
+			cfg.Logging.Logs = map[string]*caddy.CustomLog{}
+		}
+		if _, ok := cfg.Logging.Logs["default"]; !ok {
+			cfg.Logging.Logs["default"] = &caddy.CustomLog{
+				BaseLog: caddy.BaseLog{Level: "DEBUG"},
+			}
+		}
+	}
+
+	if err := caddy.Run(&cfg); err != nil {
+		return caddy.ExitCodeFailedStartup, err
+	}
+
+	go watchStdin()
+
+	select {}
 }
 
 func cmdTailscaleProxy(fs caddycmd.Flags) (int, error) {
