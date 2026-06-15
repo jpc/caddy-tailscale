@@ -303,6 +303,55 @@ That is no longer required nor recommended and will be removed in a future versi
 
 [Tailscale's HTTPS support]: https://tailscale.com/kb/1153/enabling-https
 
+### Tailscale Funnel
+
+[Tailscale Funnel] exposes a node to the public internet through Tailscale's edge,
+with automatic TLS termination via the node's `*.ts.net` hostname.
+Funnel must be [enabled in the tailnet ACL] and on the specific node.
+
+Use the `tailscale+funnel` (or `tailscale+funnel-only`) network listeners to bind
+a Caddy site to a Funnel endpoint:
+
+```caddyfile
+myhost.tail1234.ts.net {
+  bind tailscale+funnel/myhost
+  respond "Hello, internet!"
+}
+```
+
+`tailscale+funnel` listens on both the public internet (via Funnel) and the local
+tailnet, matching the default behaviour of `tsnet.Server.ListenFunnel`.
+Use `tailscale+funnel-only` if you want to reject in-tailnet connections — handy
+when you also serve a `tailscale+tls` site on the same backend with stricter
+authentication.
+
+Funnel only supports TCP on ports **443**, **8443**, and **10000**.
+Any other port is rejected at config parse time.
+
+A common setup is a public unauthenticated funnel listener alongside a tailnet-only
+authenticated listener, both reverse-proxying to the same upstream:
+
+```caddyfile
+# Public — anyone on the internet
+myhost.tail1234.ts.net {
+  bind tailscale+funnel-only/myhost:443
+  reverse_proxy localhost:5057
+}
+
+# Tailnet-only — adds Tailscale identity headers
+myhost-admin.tail1234.ts.net:8443 {
+  bind tailscale+tls/myhost:8443
+  tailscale_auth
+  reverse_proxy localhost:5057
+}
+```
+
+TLS certificates are obtained automatically by `tsnet` using the node's
+`*.ts.net` hostname; no Caddy `tls` directive is needed.
+
+[Tailscale Funnel]: https://tailscale.com/kb/1223/funnel
+[enabled in the tailnet ACL]: https://tailscale.com/kb/1223/funnel#allow-funnel-access-in-acl
+
 ## Authentication provider
 
 Set up the Tailscale authentication provider with the `tailscale_auth` directive.

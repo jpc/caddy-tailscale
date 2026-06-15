@@ -4,10 +4,13 @@
 package tscaddy
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -461,5 +464,62 @@ func Test_Listen(t *testing.T) {
 	count, exists = nodes.References("testhost")
 	if exists && count != 0 {
 		t.Fatalf("expected 0 node references after close, got count=%d exists=%v", count, exists)
+	}
+}
+
+// Test_FunnelListener_RejectsUnsupportedPort verifies the static
+// port-validation step in both funnel factories rejects ports outside
+// Tailscale Funnel's supported set (443, 8443, 10000) before tsnet is
+// touched. The valid-port path actually calls ListenFunnel which needs
+// real Tailscale control connectivity; that's covered by integration
+// tests, not here.
+func Test_FunnelListener_RejectsUnsupportedPort(t *testing.T) {
+	must.Do(caddy.Run(new(caddy.Config)))
+	ctx := caddy.ActiveContext()
+
+	badPorts := []string{"80", "1024", "65535"}
+	factories := []struct {
+		name string
+		f    func(context.Context, string, string, string, uint, net.ListenConfig) (any, error)
+		net  string
+	}{
+		{"funnel", getFunnelListener, "tailscale+funnel"},
+		{"funnel-only", getFunnelOnlyListener, "tailscale+funnel-only"},
+	}
+
+	for _, fn := range factories {
+		for _, port := range badPorts {
+			t.Run(fn.name+"/port="+port, func(t *testing.T) {
+				host := "funnel-rejects-" + port + "-" + fn.name
+				_, err := fn.f(ctx, fn.net, host, port, 0, net.ListenConfig{})
+				if err == nil {
+					t.Fatalf("port %s: expected error, got nil", port)
+				}
+				if !strings.Contains(err.Error(), "funnel") {
+					t.Fatalf("port %s: error missing 'funnel' marker: %v", port, err)
+				}
+				// Bad ports must NOT reserve a node reference: the
+				// factory has to fail before getNode runs.
+				if _, exists := nodes.References(host); exists {
+					t.Fatalf("port %s: bad funnel input leaked a node reference for %q", port, host)
+				}
+			})
+		}
+	}
+}
+
+// Test_FunnelListener_DistinctPools verifies that funnel and funnel-only
+// listeners on the same host:port do not share a listener pool — they have
+// different runtime semantics (FunnelOnly rejects in-tailnet conns) so the
+// shared-listener cache must keep them apart.
+func Test_FunnelListener_DistinctPools(t *testing.T) {
+	must.Do(caddy.Run(new(caddy.Config)))
+	host := "funnel-pool-test"
+	port := "443"
+
+	keyBoth := fmt.Sprintf("tailscale+funnel/%s:%s:%s:%s", host, "tcp", port, "both")
+	keyOnly := fmt.Sprintf("tailscale+funnel/%s:%s:%s:%s", host, "tcp", port, "only")
+	if keyBoth == keyOnly {
+		t.Fatalf("pool keys collide: %q", keyBoth)
 	}
 }

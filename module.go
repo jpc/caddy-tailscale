@@ -34,6 +34,8 @@ import (
 func init() {
 	caddy.RegisterNetwork("tailscale", getTCPListener)
 	caddy.RegisterNetwork("tailscale+tls", getTLSListener)
+	caddy.RegisterNetwork("tailscale+funnel", getFunnelListener)
+	caddy.RegisterNetwork("tailscale+funnel-only", getFunnelOnlyListener)
 	caddy.RegisterNetwork("tailscale/udp", getUDPListener)
 	caddyhttp.RegisterNetworkHTTP3("tailscale/udp", "tailscale/udp")
 	caddyhttp.RegisterNetworkHTTP3("tailscale", "tailscale/udp")
@@ -139,6 +141,92 @@ func getTLSListener(c context.Context, network string, host string, portRange st
 
 		return &tailscaleSharedListener{
 			Listener: tlsLn,
+			key:      lnKey,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &tailscaleFakeCloseListener{
+		tailscaleSharedListener: sharedLn.(*tailscaleSharedListener),
+		node:                    &fakeCloseNode{nodeName: host, node: node},
+	}, nil
+}
+
+// funnelPorts are the only TCP ports Tailscale Funnel currently accepts.
+// See https://tailscale.com/kb/1223/funnel for the canonical list.
+var funnelPorts = map[string]struct{}{
+	"443":   {},
+	"8443":  {},
+	"10000": {},
+}
+
+// getFunnelListener returns a TLS-terminated listener that accepts traffic
+// from the public internet via Tailscale Funnel AND from the local tailnet,
+// matching tsnet.Server.ListenFunnel's default behaviour.
+//
+// Funnel must be enabled in the tailnet ACL and on the specific node.
+// Only the three TCP ports Tailscale Funnel supports are accepted.
+func getFunnelListener(c context.Context, network string, host string, portRange string, portOffset uint, _ net.ListenConfig) (any, error) {
+	return getFunnelListenerImpl(c, network, host, portRange, portOffset, false)
+}
+
+// getFunnelOnlyListener is the same as getFunnelListener but applies the
+// tsnet.FunnelOnly option, rejecting connections from inside the tailnet.
+// Useful when you want a separate tailnet-only listener with caddytail's
+// auth headers and a strictly-public funnel listener that bypasses them.
+func getFunnelOnlyListener(c context.Context, network string, host string, portRange string, portOffset uint, _ net.ListenConfig) (any, error) {
+	return getFunnelListenerImpl(c, network, host, portRange, portOffset, true)
+}
+
+func getFunnelListenerImpl(c context.Context, network string, host string, portRange string, portOffset uint, funnelOnly bool) (any, error) {
+	ctx, ok := c.(caddy.Context)
+	if !ok {
+		return nil, fmt.Errorf("context is not a caddy.Context: %T", c)
+	}
+
+	na, err := caddy.ParseNetworkAddress(caddy.JoinNetworkAddress(network, host, portRange))
+	if err != nil {
+		return nil, err
+	}
+
+	addr := na.JoinHostPort(portOffset)
+	_, host, port, err := caddy.SplitNetworkAddress(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, ok := funnelPorts[port]; !ok {
+		return nil, fmt.Errorf("tailscale funnel only supports TCP ports 443, 8443, 10000 (got %q)", port)
+	}
+
+	// Get node reference for this listener (increments node reference count)
+	node, err := getNode(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	// Funnel-only and Funnel-plus-tailnet need separate pool keys so they
+	// don't accidentally share a listener.
+	mode := "both"
+	if funnelOnly {
+		mode = "only"
+	}
+	lnKey := fmt.Sprintf("tailscale+funnel/%s:%s:%s:%s", host, "tcp", port, mode)
+
+	sharedLn, _, err := tailscaleListeners.LoadOrNew(lnKey, func() (caddy.Destructor, error) {
+		var opts []tsnet.FunnelOption
+		if funnelOnly {
+			opts = append(opts, tsnet.FunnelOnly())
+		}
+		ln, err := node.ListenFunnel("tcp", ":"+port, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("tailscale+funnel listen: %w", err)
+		}
+
+		return &tailscaleSharedListener{
+			Listener: ln,
 			key:      lnKey,
 		}, nil
 	})
