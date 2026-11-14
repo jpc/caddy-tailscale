@@ -352,6 +352,27 @@ TLS certificates are obtained automatically by `tsnet` using the node's
 [Tailscale Funnel]: https://tailscale.com/kb/1223/funnel
 [enabled in the tailnet ACL]: https://tailscale.com/kb/1223/funnel#allow-funnel-access-in-acl
 
+### Tailscale Services
+
+A node can advertise a [Tailscale Service](https://tailscale.com/kb/1552/tailscale-services)
+using the `tailscale+svc` network:
+
+```
+tailscale+svc/<service>@<node>:<port>
+```
+
+For example, `tailscale+svc/research@research-a:443` advertises `svc:research` on port 443
+from the node `research-a`. Run the same config with a different node name on other machines
+to get failover: Tailscale routes clients to any healthy, approved host.
+
+- The hosting node must be tagged (see `tags`), and the Service must exist in the admin
+  console with the host approved (manually or via auto-approval).
+- tailscaled terminates TLS for the Service FQDN (`research.<tailnet>.ts.net`), so the
+  Caddy server using this listener must serve plain HTTP (`h1`) and must not configure
+  TLS for it. Disable automatic HTTPS for that server.
+- The client address is passed via the PROXY protocol, so the `tailscale` authentication
+  provider works as normal.
+
 ## Authentication provider
 
 Set up the Tailscale authentication provider with the `tailscale_auth` directive.

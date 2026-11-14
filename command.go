@@ -32,7 +32,7 @@ func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "tailscale-auth",
 		Func:  cmdTailscaleAuth,
-		Usage: "[--hostname <name>] [--control-url <url>] [--state-dir <dir>] [--auth-key <key>]",
+		Usage: "[--hostname <name>] [--control-url <url>] [--state-dir <dir>] [--auth-key <key>] [--tags <tag:a,tag:b>]",
 		Short: "Authenticate a Tailscale node before starting Caddy",
 		Long: `
 Checks the authentication status of a Tailscale node and, if needed, displays
@@ -47,6 +47,7 @@ Since state is persisted to the same directory Caddy will use, the subsequent
 			fs.String("control-url", "", "Custom Tailscale control server URL")
 			fs.String("state-dir", "", "Override the state directory")
 			fs.String("auth-key", "", "Tailscale auth key for non-interactive authentication")
+			fs.String("tags", "", "Comma-separated ACL tags to advertise (required for Tailscale Service hosts)")
 			return fs
 		}(),
 	})
@@ -331,6 +332,12 @@ func cmdTailscaleAuth(fs caddycmd.Flags) (int, error) {
 	controlURL := fs.String("control-url")
 	stateDir := fs.String("state-dir")
 	authKey := fs.String("auth-key")
+	var tags []string
+	for _, t := range strings.Split(fs.String("tags"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tags = append(tags, t)
+		}
+	}
 
 	if stateDir == "" {
 		configDir, err := os.UserConfigDir()
@@ -346,11 +353,12 @@ func cmdTailscaleAuth(fs caddycmd.Flags) (int, error) {
 	fmt.Fprintf(os.Stderr, "Tailscale auth: checking node %q...\n", hostname)
 
 	s := &tsnet.Server{
-		Hostname:   hostname,
-		Dir:        stateDir,
-		AuthKey:    authKey,
-		ControlURL: controlURL,
-		Logf:       func(string, ...any) {}, // suppress debug noise
+		Hostname:      hostname,
+		Dir:           stateDir,
+		AuthKey:       authKey,
+		ControlURL:    controlURL,
+		AdvertiseTags: tags,
+		Logf:          func(string, ...any) {}, // suppress debug noise
 		UserLogf: func(format string, args ...any) {
 			msg := fmt.Sprintf(format, args...)
 			if strings.Contains(msg, "/a/") {
