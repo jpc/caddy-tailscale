@@ -6,7 +6,6 @@ package tscaddy
 // auth.go contains the TailscaleAuth module and supporting logic.
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"reflect"
@@ -145,15 +144,33 @@ func (ta Auth) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.U
 		return user, false, err
 	}
 
-	if len(info.Node.Tags) != 0 {
-		return user, false, fmt.Errorf("node %s has tags", info.Node.Hostinfo.Hostname())
-	}
-
 	var tailnet string
 	if !info.Node.Hostinfo.ShareeNode() {
 		if s, found := strings.CutPrefix(info.Node.Name, info.Node.ComputedName+"."); found {
 			tailnet = strings.TrimSuffix(s, ".")
 		}
+	}
+
+	// Tagged nodes have no human login. Upstream caddy-tailscale used to
+	// reject them outright (`return user, false, ...`) which fails the
+	// request at 401 BEFORE Caddy can proxy it. We instead authenticate
+	// them so the request flows through, but leave the user-* metadata
+	// EMPTY — downstream apps can detect "tagged service node" by the
+	// absence of Tailscale-User-Login and decide per-endpoint policy.
+	if len(info.Node.Tags) != 0 {
+		tags := make([]string, 0, len(info.Node.Tags))
+		tags = append(tags, info.Node.Tags...)
+		user.ID = info.Node.Hostinfo.Hostname()
+		user.Metadata = map[string]string{
+			"tailscale_login":           "",
+			"tailscale_user":            "",
+			"tailscale_name":            info.Node.Hostinfo.Hostname(),
+			"tailscale_profile_picture": "",
+			"tailscale_tailnet":         tailnet,
+			"tailscale_tags":            strings.Join(tags, ","),
+			"tailscale_node":            info.Node.Hostinfo.Hostname(),
+		}
+		return user, true, nil
 	}
 
 	user.ID = info.UserProfile.LoginName
@@ -163,6 +180,8 @@ func (ta Auth) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.U
 		"tailscale_name":            info.UserProfile.DisplayName,
 		"tailscale_profile_picture": info.UserProfile.ProfilePicURL,
 		"tailscale_tailnet":         tailnet,
+		"tailscale_tags":            "",
+		"tailscale_node":            info.Node.Hostinfo.Hostname(),
 	}
 	return user, true, nil
 }

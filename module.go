@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -28,7 +29,9 @@ import (
 	"go.uber.org/zap"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
+	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
+	"tailscale.com/util/mak"
 )
 
 func init() {
@@ -224,6 +227,23 @@ func getFunnelListenerImpl(c context.Context, network string, host string, portR
 		if err != nil {
 			return nil, fmt.Errorf("tailscale+funnel listen: %w", err)
 		}
+
+		// Workaround for a tsnet race: ListenFunnel calls Up() which wipes
+		// the persisted serve config to {}, then ListenFunnel writes
+		// AllowFunnel back. Between those two writes a netmap/prefs update
+		// can fire reloadServeConfigLocked, which re-reads the stale {}
+		// from disk and reverts in-memory state — IngressEnabled flips
+		// false ~60ms after going true and the funnel relay stops
+		// accepting traffic until next restart. Empirically reproduced 5/5
+		// on tailscale.com v1.90.9. The watcher polls and re-asserts
+		// AllowFunnel whenever it goes missing.
+		var logger *zap.Logger
+		if appIface, _ := ctx.App("tailscale"); appIface != nil {
+			if app, ok := appIface.(*App); ok && app.logger != nil {
+				logger = app.logger
+			}
+		}
+		go watchAndRestoreFunnel(node.Server, port, logger)
 
 		return &tailscaleSharedListener{
 			Listener: ln,
@@ -657,4 +677,83 @@ type localAPITransport struct {
 
 func (t *localAPITransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.DoLocalRequest(req)
+}
+
+// watchAndRestoreFunnel keeps the funnel listener for (node, port) alive in
+// the face of a tsnet bug where the in-memory serve config can revert to {}
+// shortly after ListenFunnel returns (see the call site for the full
+// explanation). It runs as a background goroutine for the lifetime of the
+// process; on every tick, if the AllowFunnel entry for this hostport is
+// missing, it re-asserts it via SetServeConfig.
+//
+// The polling cadence is deliberately tight (1s) because the bug's repair
+// window matters: until AllowFunnel is restored, the public funnel relay
+// closes the TCP connection at TLS, so any user-visible request during the
+// outage just errors. 1s of downtime per regression is acceptable; 30s is
+// not. CPU/IO cost is negligible (one localapi call per second per funnel
+// listener — there is one per process in practice).
+func watchAndRestoreFunnel(s *tsnet.Server, port string, logger *zap.Logger) {
+	if s == nil {
+		return
+	}
+	ctx := context.Background()
+	lc, err := s.LocalClient()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("funnel-watchdog: LocalClient failed", zap.Error(err))
+		}
+		return
+	}
+	// Resolve the cert domain once; it shouldn't change for the life of
+	// the node. If Status fails transiently, retry briefly.
+	var domain string
+	for i := 0; i < 30 && domain == ""; i++ {
+		st, err := lc.Status(ctx)
+		if err == nil && st != nil && len(st.CertDomains) > 0 {
+			domain = st.CertDomains[0]
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if domain == "" {
+		if logger != nil {
+			logger.Warn("funnel-watchdog: no cert domain after 30s; not watching",
+				zap.String("port", port))
+		}
+		return
+	}
+	hp := ipn.HostPort(domain + ":" + port)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	restoredCount := 0
+	for range ticker.C {
+		sc, err := lc.GetServeConfig(ctx)
+		if err != nil {
+			continue
+		}
+		if sc == nil {
+			sc = &ipn.ServeConfig{}
+		}
+		if sc.AllowFunnel[hp] {
+			continue
+		}
+		mak.Set(&sc.AllowFunnel, hp, true)
+		if err := lc.SetServeConfig(ctx, sc); err != nil {
+			if logger != nil {
+				logger.Warn("funnel-watchdog: SetServeConfig failed",
+					zap.String("hostport", string(hp)), zap.Error(err))
+			}
+			continue
+		}
+		restoredCount++
+		if logger != nil {
+			// Throttle: log first 3 restores per process, then once per
+			// 100 to surface chronic flapping without spamming.
+			if restoredCount <= 3 || restoredCount%100 == 0 {
+				logger.Info("funnel-watchdog: restored AllowFunnel",
+					zap.String("hostport", string(hp)),
+					zap.Int("restore_count", restoredCount))
+			}
+		}
+	}
 }
